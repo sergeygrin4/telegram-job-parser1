@@ -251,11 +251,11 @@
     <div id="channels-tab" class="tab-content">
         <div class="add-channel-form">
             <div class="input-group">
-                <label for="channel-username">Username канала</label>
+                <label for="channel-username">Username или ссылка на канал</label>
                 <input 
                     type="text" 
                     id="channel-username" 
-                    placeholder="@python_jobs или python_jobs"
+                    placeholder="@python_jobs, python_jobs или https://t.me/python_jobs"
                 >
             </div>
             <button class="btn" onclick="addChannel()">Добавить канал</button>
@@ -370,13 +370,48 @@
             }
         }
 
+        // Извлечение username из ссылки или текста
+        function extractUsername(input) {
+            if (!input) return null;
+            
+            input = input.trim();
+            
+            // Если это ссылка t.me/username
+            const tmeMatch = input.match(/t\.me\/([a-zA-Z0-9_]+)/);
+            if (tmeMatch) {
+                return tmeMatch[1];
+            }
+            
+            // Если это ссылка https://t.me/username
+            const httpsMatch = input.match(/https?:\/\/t\.me\/([a-zA-Z0-9_]+)/);
+            if (httpsMatch) {
+                return httpsMatch[1];
+            }
+            
+            // Если это @username
+            if (input.startsWith('@')) {
+                return input.substring(1);
+            }
+            
+            // Если это просто username
+            return input;
+        }
+
         // Добавление канала
         async function addChannel() {
             const input = document.getElementById('channel-username');
-            const username = input.value.trim();
+            const rawInput = input.value.trim();
 
+            if (!rawInput) {
+                showError('Введите username или ссылку на канал');
+                return;
+            }
+
+            // Извлекаем username из любого формата
+            const username = extractUsername(rawInput);
+            
             if (!username) {
-                showError('Введите username канала');
+                showError('Неверный формат. Используйте: @username, username или https://t.me/username');
                 return;
             }
 
@@ -390,7 +425,7 @@
                 });
 
                 if (response.ok) {
-                    showSuccess('Канал успешно добавлен');
+                    showSuccess(`Канал @${username} успешно добавлен`);
                     input.value = '';
                     loadChannels();
                 } else {
