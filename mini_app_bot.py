@@ -41,16 +41,22 @@ def init_db():
             chat_title TEXT,
             text TEXT,
             link TEXT,
+            content_hash TEXT UNIQUE,
+            source_type TEXT DEFAULT 'telegram',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
+            url TEXT UNIQUE,
+            source_type TEXT DEFAULT 'telegram',
+            enabled INTEGER DEFAULT 1,
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_content_hash ON jobs(content_hash)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON jobs(created_at DESC)')
     conn.commit()
     conn.close()
     logger.info("База данных инициализирована")
@@ -100,24 +106,39 @@ def post_job():
         return jsonify({"error": "Unauthorized"}), 401
     
     try:
+        import hashlib
+        
         data = request.json
         chat_title = data.get('chat_title', 'Неизвестный канал')
         text = data.get('text', '')
         link = data.get('link', '')
+        source_type = data.get('source_type', 'telegram')
         
-        # Сохранение в БД
+        # Создаем хеш для дедупликации
+        content = f"{chat_title}:{text[:200]}"
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+        
+        # Сохранение в БД с проверкой дубликатов
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute(
-            'INSERT INTO jobs (chat_title, text, link) VALUES (?, ?, ?)',
-            (chat_title, text, link)
-        )
-        conn.commit()
+        
+        try:
+            cursor.execute(
+                'INSERT INTO jobs (chat_title, text, link, content_hash, source_type) VALUES (?, ?, ?, ?, ?)',
+                (chat_title, text, link, content_hash, source_type)
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.close()
+            logger.info(f"Дубликат пропущен: {chat_title[:30]}...")
+            return jsonify({"status": "duplicate", "message": "Job already exists"}), 200
+        
         conn.close()
         
         # Формирование сообщения для менеджера
-        message = f"📋 <b>Новая вакансия</b>\n\n"
-        message += f"📢 Канал: {chat_title}\n"
+        source_emoji = {"telegram": "📱", "facebook": "📘", "google": "📊"}.get(source_type, "📋")
+        message = f"{source_emoji} <b>Новая вакансия</b>\n\n"
+        message += f"📢 Источник: {chat_title}\n"
         message += f"📝 Текст: {text[:200]}{'...' if len(text) > 200 else ''}\n"
         if link:
             message += f"🔗 Ссылка: {link}\n"
@@ -182,7 +203,7 @@ def get_channels():
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute('SELECT id, username, added_at FROM channels ORDER BY added_at DESC')
+        cursor.execute('SELECT id, url, source_type, enabled, added_at FROM channels ORDER BY added_at DESC')
         channels = cursor.fetchall()
         conn.close()
         
@@ -190,8 +211,10 @@ def get_channels():
             "channels": [
                 {
                     "id": ch[0],
-                    "username": ch[1],
-                    "added_at": ch[2]
+                    "url": ch[1],
+                    "source_type": ch[2],
+                    "enabled": bool(ch[3]),
+                    "added_at": ch[4]
                 }
                 for ch in channels
             ]
@@ -205,18 +228,28 @@ def add_channel():
     """Добавление канала для отслеживания"""
     try:
         data = request.json
-        username = data.get('username', '').strip()
+        url = data.get('url', '').strip()
+        source_type = data.get('source_type', 'telegram').lower()
         
-        if not username:
-            return jsonify({"error": "Username is required"}), 400
+        if not url:
+            return jsonify({"error": "URL is required"}), 400
         
-        # Убираем @ если есть
-        username = username.lstrip('@')
+        # Нормализация URL
+        if source_type == 'telegram':
+            # Извлекаем username из ссылки
+            import re
+            match = re.search(r't\.me/([a-zA-Z0-9_]+)', url)
+            if match:
+                url = match.group(1)
+            url = url.lstrip('@')
         
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         try:
-            cursor.execute('INSERT INTO channels (username) VALUES (?)', (username,))
+            cursor.execute(
+                'INSERT INTO channels (url, source_type) VALUES (?, ?)',
+                (url, source_type)
+            )
             conn.commit()
             channel_id = cursor.lastrowid
             conn.close()
@@ -225,8 +258,13 @@ def add_channel():
                 "status": "success",
                 "channel": {
                     "id": channel_id,
-                    "username": username
+                    "url": url,
+                    "source_type": source_type
                 }
+            })
+        except sqlite3.IntegrityError:
+            conn.close()
+            return jsonify({"error": "Channel already exists"}), 409
             })
         except sqlite3.IntegrityError:
             conn.close()
