@@ -265,10 +265,6 @@ def add_channel():
         except sqlite3.IntegrityError:
             conn.close()
             return jsonify({"error": "Channel already exists"}), 409
-            })
-        except sqlite3.IntegrityError:
-            conn.close()
-            return jsonify({"error": "Channel already exists"}), 409
             
     except Exception as e:
         logger.error(f"Ошибка добавления канала: {e}")
