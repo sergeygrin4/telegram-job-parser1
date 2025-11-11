@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import requests
+import base64
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
@@ -12,15 +13,27 @@ log = logging.getLogger("parser")
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 SESSION_PATH = os.getenv("TELETHON_SESSION", "parser.session")
+SESSION_BASE64 = os.getenv("TELETHON_SESSION_BASE64", "")
 BOT_API = os.getenv("BOT_API", "http://localhost:8000/post")
-CHANNELS = [c.strip() for c in os.getenv("CHANNELS", "").split(",") if c.strip()]
+CHANNELS = [c.strip() for c in os.getenv("TELEGRAM_CHANNELS", "").split(",") if c.strip()]
 SHARED_SECRET = os.getenv("SHARED_SECRET")
+
+# Декодируем Base64 сессию если есть
+if SESSION_BASE64:
+    try:
+        session_data = base64.b64decode(SESSION_BASE64)
+        os.makedirs(os.path.dirname(SESSION_PATH) if os.path.dirname(SESSION_PATH) else ".", exist_ok=True)
+        with open(SESSION_PATH, 'wb') as f:
+            f.write(session_data)
+        log.info(f"✅ Сессия декодирована из Base64 и сохранена в {SESSION_PATH}")
+    except Exception as e:
+        log.error(f"❌ Ошибка декодирования сессии: {e}")
 
 if not API_ID or not API_HASH:
     log.error("Не заданы TELEGRAM_API_ID/TELEGRAM_API_HASH.")
     raise SystemExit(1)
 if not CHANNELS:
-    log.warning("Переменная CHANNELS пуста. Задай список каналов через запятую.")
+    log.warning("⚠️ TELEGRAM_CHANNELS пуста. Задай список каналов через запятую.")
 
 headers = {"X-SECRET": SHARED_SECRET} if SHARED_SECRET else {}
 
