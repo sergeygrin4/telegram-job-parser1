@@ -127,14 +127,32 @@ def main():
         log.info("Добавь в .env: FB_GROUPS=group_id_1,group_id_2")
         return
     
-    total = 0
-    for group in FB_GROUPS:
-        group = group.strip()
-        if group:
-            count = parse_facebook_group_with_cookies(group)
-            total += count
+    import time
+    CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_MINUTES", "5"))
     
-    log.info(f"✅ Всего обработано {total} постов")
+    log.info(f"⏰ Интервал проверки: {CHECK_INTERVAL} минут")
+    
+    while True:
+        try:
+            log.info("🔄 Начинаю цикл парсинга...")
+            total = 0
+            for group in FB_GROUPS:
+                group = group.strip()
+                if group:
+                    count = parse_facebook_group_with_cookies(group)
+                    total += count
+            
+            log.info(f"✅ Цикл завершен. Обработано {total} постов")
+            log.info(f"⏳ Ожидание {CHECK_INTERVAL} минут до следующей проверки...")
+            time.sleep(CHECK_INTERVAL * 60)
+            
+        except KeyboardInterrupt:
+            log.info("⛔ Остановка парсера...")
+            break
+        except Exception as e:
+            log.error(f"❌ Ошибка в основном цикле: {e}")
+            log.info("⏳ Повтор через 1 минуту...")
+            time.sleep(60)
 
 if __name__ == "__main__":
     main()
