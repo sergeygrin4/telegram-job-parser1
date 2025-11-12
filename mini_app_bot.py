@@ -2,13 +2,9 @@ import os
 import logging
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
-import asyncio
-from threading import Thread
 import sqlite3
-from datetime import datetime
-import json
+import hashlib
+import requests
 
 # Настройка логирования
 logging.basicConfig(
@@ -24,93 +20,66 @@ SHARED_SECRET = os.getenv('SHARED_SECRET', 'default-secret-key')
 PORT = int(os.getenv('PORT', 8000))
 WEB_APP_URL = os.getenv('WEB_APP_URL', 'http://localhost:8000')
 DB_PATH = os.getenv('DB_PATH', 'jobs.db')
-WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')  # Например: https://your-app.railway.app/telegram-webhook
 
 app = Flask(__name__, static_folder='static')
 CORS(app)
 
-# Глобальная переменная для бота
-bot_app = None
-bot = None
-
 # Инициализация БД
 def init_db():
     """Инициализация базы данных"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_title TEXT,
-            text TEXT,
-            link TEXT,
-            content_hash TEXT UNIQUE,
-            source_type TEXT DEFAULT 'telegram',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS channels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE,
-            source_type TEXT DEFAULT 'telegram',
-            enabled INTEGER DEFAULT 1,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_content_hash ON jobs(content_hash)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON jobs(created_at DESC)')
-    conn.commit()
-    conn.close()
-    logger.info("База данных инициализирована")
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start с кнопкой для открытия мини-апа"""
-    keyboard = {
-        "inline_keyboard": [[
-            {
-                "text": "🔍 Открыть поиск вакансий",
-                "web_app": {"url": f"{WEB_APP_URL}/index.html"}
-            }
-        ]]
-    }
-    
-    await update.message.reply_text(
-        "👋 Привет! Нажми на кнопку ниже, чтобы открыть поиск вакансий:",
-        reply_markup=keyboard
-    )
-
-async def send_telegram_message(chat_id: str, message: str):
-    """Отправка сообщения через Telegram бота"""
-    if bot:
-        try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=message,
-                parse_mode='HTML'
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_title TEXT,
+                text TEXT,
+                link TEXT,
+                content_hash TEXT UNIQUE,
+                source_type TEXT DEFAULT 'telegram',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка отправки сообщения: {e}")
-            return False
-    return False
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT UNIQUE,
+                source_type TEXT DEFAULT 'telegram',
+                enabled INTEGER DEFAULT 1,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_content_hash ON jobs(content_hash)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON jobs(created_at DESC)')
+        conn.commit()
+        conn.close()
+        logger.info("✅ База данных инициализирована")
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации БД: {e}")
+
+def send_telegram_message(chat_id: str, message: str):
+    """Отправка сообщения через Telegram Bot API"""
+    if not BOT_TOKEN:
+        return False
+    
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки в Telegram: {e}")
+        return False
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
-    return jsonify({"status": "ok", "service": "telegram-job-parser"})
-
-@app.route('/telegram-webhook', methods=['POST'])
-def telegram_webhook():
-    """Webhook endpoint для Telegram бота"""
-    try:
-        if bot_app:
-            update = Update.de_json(request.get_json(force=True), bot_app.bot)
-            asyncio.run(bot_app.process_update(update))
-        return jsonify({"ok": True})
-    except Exception as e:
-        logger.error(f"Ошибка обработки webhook: {e}")
-        return jsonify({"error": str(e)}), 500
+    return jsonify({"status": "ok", "service": "telegram-job-parser"}), 200
 
 @app.route('/post', methods=['POST'])
 def post_job():
@@ -122,21 +91,19 @@ def post_job():
         return jsonify({"error": "Unauthorized"}), 401
     
     try:
-        import hashlib
-        
         data = request.json
         chat_title = data.get('chat_title', 'Неизвестный канал')
         text = data.get('text', '')
         link = data.get('link', '')
         source_type = data.get('source_type', 'telegram')
         
-        logger.info(f"📥 Получено: {chat_title} - {text[:50]}...")
+        logger.info(f"📥 Получено от парсера: {chat_title} - {text[:50]}...")
         
         # Создаем хеш для дедупликации
         content = f"{chat_title}:{text[:200]}"
         content_hash = hashlib.md5(content.encode()).hexdigest()
         
-        # Сохранение в БД с проверкой дубликатов
+        # Сохранение в БД
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
@@ -146,47 +113,37 @@ def post_job():
                 (chat_title, text, link, content_hash, source_type)
             )
             conn.commit()
-            logger.info(f"✅ Сохранено в БД: {chat_title}")
+            logger.info(f"✅ Сохранено в БД")
         except sqlite3.IntegrityError:
             conn.close()
-            logger.info(f"⚠️ Дубликат пропущен: {chat_title[:30]}...")
-            return jsonify({"status": "duplicate", "message": "Job already exists"}), 200
+            logger.info(f"⚠️ Дубликат пропущен")
+            return jsonify({"status": "duplicate"}), 200
         
         conn.close()
         
-        # Формирование сообщения для менеджера
-        source_emoji = {"telegram": "📱", "facebook": "📘", "google": "📊"}.get(source_type, "📋")
-        message = f"{source_emoji} <b>Новая вакансия</b>\n\n"
-        message += f"📢 Источник: {chat_title}\n"
-        message += f"📝 Текст: {text[:200]}{'...' if len(text) > 200 else ''}\n"
-        if link:
-            message += f"🔗 Ссылка: {link}\n"
-        
-        # Отправка сообщения
-        if MANAGER_CHAT_ID:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(
-                send_telegram_message(MANAGER_CHAT_ID, message)
-            )
-            loop.close()
+        # Отправка уведомления менеджеру
+        if MANAGER_CHAT_ID and BOT_TOKEN:
+            source_emoji = {"telegram": "📱", "facebook": "📘", "google": "📊"}.get(source_type, "📋")
+            message = f"{source_emoji} <b>Новая вакансия</b>\n\n"
+            message += f"📢 {chat_title}\n"
+            message += f"📝 {text[:200]}{'...' if len(text) > 200 else ''}\n"
+            if link:
+                message += f"🔗 {link}\n"
             
-            if result:
-                logger.info(f"✉️ Уведомление отправлено менеджеру")
-                return jsonify({"status": "success"}), 200
+            if send_telegram_message(MANAGER_CHAT_ID, message):
+                logger.info(f"✉️ Уведомление отправлено")
             else:
                 logger.warning(f"⚠️ Не удалось отправить уведомление")
-                return jsonify({"status": "saved_but_not_sent"}), 200
-        else:
-            return jsonify({"status": "success"}), 200
+        
+        return jsonify({"status": "success"}), 200
             
     except Exception as e:
-        logger.error(f"❌ Ошибка обработки запроса: {e}")
+        logger.error(f"❌ Ошибка: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/jobs', methods=['GET'])
 def get_jobs():
-    """Получение списка вакансий для мини-апа"""
+    """Получение списка вакансий"""
     try:
         limit = int(request.args.get('limit', 50))
         offset = int(request.args.get('offset', 0))
@@ -218,12 +175,12 @@ def get_jobs():
             "total": total
         })
     except Exception as e:
-        logger.error(f"Ошибка получения вакансий: {e}")
+        logger.error(f"❌ Ошибка: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/channels', methods=['GET'])
 def get_channels():
-    """Получение списка отслеживаемых каналов"""
+    """Получение списка каналов"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -244,19 +201,19 @@ def get_channels():
             ]
         })
     except Exception as e:
-        logger.error(f"Ошибка получения каналов: {e}")
+        logger.error(f"❌ Ошибка: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/channels', methods=['POST'])
 def add_channel():
-    """Добавление канала для отслеживания"""
+    """Добавление канала"""
     try:
         data = request.json
         url = data.get('url', '').strip()
         source_type = data.get('source_type', 'telegram').lower()
         
         if not url:
-            return jsonify({"error": "URL is required"}), 400
+            return jsonify({"error": "URL required"}), 400
         
         # Нормализация URL
         if source_type == 'telegram':
@@ -287,10 +244,10 @@ def add_channel():
             })
         except sqlite3.IntegrityError:
             conn.close()
-            return jsonify({"error": "Channel already exists"}), 409
+            return jsonify({"error": "Already exists"}), 409
             
     except Exception as e:
-        logger.error(f"Ошибка добавления канала: {e}")
+        logger.error(f"❌ Ошибка: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/channels/<int:channel_id>', methods=['DELETE'])
@@ -305,7 +262,7 @@ def delete_channel(channel_id):
         
         return jsonify({"status": "success"})
     except Exception as e:
-        logger.error(f"Ошибка удаления канала: {e}")
+        logger.error(f"❌ Ошибка: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/')
@@ -318,55 +275,14 @@ def static_files(path):
     """Статические файлы"""
     return send_from_directory('static', path)
 
-def run_flask():
-    """Запуск Flask сервера"""
-    app.run(host='0.0.0.0', port=PORT, debug=False)
-
-async def setup_bot():
-    """Настройка бота с webhook"""
-    global bot_app, bot
-    
-    bot_app = Application.builder().token(BOT_TOKEN).build()
-    bot = bot_app.bot
-    
-    # Регистрация обработчиков
-    bot_app.add_handler(CommandHandler("start", start_command))
-    
-    # Инициализация
-    await bot_app.initialize()
-    
-    # Установка webhook (вместо polling!)
-    if WEBHOOK_URL:
-        webhook_url = f"{WEBHOOK_URL}/telegram-webhook"
-        await bot.set_webhook(url=webhook_url)
-        logger.info(f"✅ Webhook установлен: {webhook_url}")
-    else:
-        logger.warning("⚠️ WEBHOOK_URL не установлен! Бот не будет получать команды.")
-    
-    logger.info("✅ Бот настроен")
-
-def main():
-    """Главная функция запуска"""
-    if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN не установлен!")
-        return
-    
-    if not MANAGER_CHAT_ID:
-        logger.warning("⚠️ MANAGER_CHAT_ID не установлен!")
+if __name__ == '__main__':
+    logger.info(f"🚀 Запуск на порту {PORT}")
+    logger.info(f"🌐 URL: {WEB_APP_URL}")
+    logger.info(f"📊 БД: {DB_PATH}")
+    logger.info(f"🔐 Секрет: {'✅' if SHARED_SECRET != 'default-secret-key' else '❌'}")
     
     # Инициализация БД
     init_db()
     
-    logger.info(f"🚀 Запуск сервера на порту {PORT}")
-    logger.info(f"🌐 Web App URL: {WEB_APP_URL}")
-    logger.info(f"📊 БД: {DB_PATH}")
-    logger.info(f"🔐 Секрет: {'✅' if SHARED_SECRET != 'default-secret-key' else '❌'}")
-    
-    # Настройка бота с webhook
-    asyncio.run(setup_bot())
-    
     # Запуск Flask
     app.run(host='0.0.0.0', port=PORT, debug=False)
-
-if __name__ == '__main__':
-    main()
